@@ -1,0 +1,154 @@
+name: produce
+on:
+  workflow_dispatch:
+    inputs: {topic: {description: "optional brief — empty = continue the series", required: false}}
+permissions:
+  contents: write
+concurrency: {group: produce, cancel-in-progress: false}
+jobs:
+  produce:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      TOPIC: ${{ github.event.inputs.topic }}
+      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 0}
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.11", cache: pip}
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg fonts-dejavu-core
+      - run: pip install -r requirements.txt
+      - name: run pipeline
+        id: run
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          EP="EP-${{ github.run_id }}"
+          STATUS=0
+          python -m py_compile pipeline.py 2>&1 | tee /tmp/log.txt || STATUS=1
+          if [ "$STATUS" = "0" ]; then
+            python pipeline.py write   --episode "$EP" --topic "$TOPIC" 2>&1 | tee -a /tmp/log.txt || STATUS=1
+          fi
+          if [ "$STATUS" = "0" ]; then
+            python pipeline.py produce --episode "$EP" 2>&1 | tee -a /tmp/log.txt || STATUS=1
+          fi
+          if [ "$STATUS" = "0" ]; then
+            python pipeline.py notify  --episode "$EP" 2>&1 | tee -a /tmp/log.txt || STATUS=1
+          fi
+          cat /tmp/log.txt
+          [ "$STATUS" = "0" ] || { echo "PIPELINE FAILED"; exit 1; }
+      - name: save series memory
+        if: success()
+        run: |
+          git config user.name "studio-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git pull --rebase --autostash origin main || true
+          git add memory/ || true
+          git diff --cached --quiet && exit 0
+          git commit -m "memory: series progress"
+          for i in 1 2 3; do git push && break || (git pull --rebase --autostash origin main; sleep 3); done
+      - name: sync episode to OpsHub
+        if: steps.run.outcome == 'success'
+        shell: python
+        env:
+          HUB_URL: ${{ secrets.HUB_URL }}
+          HUB_WEBHOOK_SECRET: ${{ secrets.HUB_WEBHOOK_SECRET }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          import hashlib, hmac, json, os, re, time, urllib.request
+
+          state_path = "memory/series_state.json"
+          if not os.path.exists(state_path):
+              print("hub_sync: no series_state.json, skipping")
+              raise SystemExit(0)
+
+          with open(state_path) as f:
+              state = json.load(f)
+
+          def slug(s):
+              return re.sub(r"[^a-z0-9]+", "-", (s or "series").lower()).strip("-") or "series"
+
+          series_id = slug(state.get("title", "series"))
+          ep = int(state.get("episode_number", 0) or 0)
+          repo = os.environ.get("GITHUB_REPOSITORY", "").split("/")[-1]
+          now = int(time.time())
+
+          events = [{
+              "schema_version": 1,
+              # deterministic id: a retried episode re-sync dedupes at the hub
+              "event_id": f"studio-{series_id}-ep{ep}-ready",
+              "type": "content.episode_ready",
+              "source": "studio",
+              "series_id": series_id,
+              "channel_name": repo,
+              "episode_number": ep,
+              "title": state.get("title", ""),
+              "hook_type": state.get("last_hook", ""),
+              "occurred_at": now,
+              "engine_version": "v8",
+          }]
+          if state.get("finished"):
+              events.append({
+                  "schema_version": 1,
+                  "event_id": f"studio-{series_id}-finished-ep{ep}",
+                  "type": "content.series_finished",
+                  "source": "studio",
+                  "series_id": series_id,
+                  "channel_name": repo,
+                  "episode_number": ep,
+                  "occurred_at": now,
+              })
+
+          url = os.environ["HUB_URL"].rstrip("/") + "/ingest"
+          secret = os.environ["HUB_WEBHOOK_SECRET"].encode()
+          for ev in events:
+              body = json.dumps(ev).encode()
+              mac = hmac.new(secret, body, hashlib.sha256)
+              req = urllib.request.Request(
+                  url, data=body, method="POST",
+                  headers={
+                      "Content-Type": "application/json",
+                      "x-hub-signature-256": "sha256=" + mac.hexdigest(),
+                  },
+              )
+              with urllib.request.urlopen(req, timeout=15) as resp:
+                  print("hub_sync:", ev["type"], "->", resp.status, resp.read().decode())
+      - name: report errors to telegram
+        if: ${{ always() && steps.run.outcome != 'success' }}
+        run: |
+          if [ -f /tmp/limit_flag.txt ]; then
+            RESET=$(cat /tmp/limit_flag.txt)
+            mkdir -p memory
+            echo "${RESET}" > memory/autoresume.flag
+            git config user.name "studio-bot"
+            git config user.email "bot@users.noreply.github.com"
+            git add memory/autoresume.flag
+            git diff --cached --quiet || git commit -m "autoresume flag"
+            for i in 1 2 3; do git push && break || (git pull --rebase --autostash origin main; sleep 3); done
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              -d chat_id="${TELEGRAM_CHAT_ID}" \
+              --data-urlencode "text=🛑 Daily free limit reached. Resets ${RESET} UTC. Auto-retry is scheduled — nothing is lost."
+            echo ""
+          else
+            if [ -f /tmp/log.txt ]; then
+              TAIL=$(tail -c 3000 /tmp/log.txt)
+            else
+              TAIL="PIPELINE NEVER STARTED - an earlier setup step failed."
+            fi
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              -d chat_id="${TELEGRAM_CHAT_ID}" \
+              --data-urlencode "text=PIPELINE FAILED - real error below:
+
+          ${TAIL}"
+            echo ""
+          fi
+          exit 1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: {name: episodes, path: "episodes/*/[!s]*", retention-days: 3}
