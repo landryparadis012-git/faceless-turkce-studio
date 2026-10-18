@@ -17,6 +17,8 @@ import argparse, base64, datetime, json, os, socket, subprocess, sys, urllib.req
 from pathlib import Path
 import requests
 
+import hub
+
 socket.setdefaulttimeout(120)
 ROOT = Path(__file__).parent
 EPS = ROOT / "episodes"
@@ -32,6 +34,48 @@ SHOTS_PER_LEVEL = 3
 TOTAL_SHOTS = LEVEL_COUNT * SHOTS_PER_LEVEL            # 21
 MAX_OUT_TOKENS = 9000     # 21 çekim + gpt-oss düşünme payı (v7: 6000/14 çekim)
 FLAVORS = ["hayatta kalma", "ihanet", "yükseliş", "intikam", "gizem", "kader", "fedakârlık"]
+
+# Every NEW series draws the next seed here, so consecutive series stop looking
+# like reruns of the same farmer. Inside one series the character is frozen in
+# memory/series_state.json, so the visuals stay consistent episode to episode.
+SERIES_SEEDS = [
+    ("12. yüzyıl Anadolu'sunda bir keresteci köyü", "toprak ağası ile köylü arasında kalan bir aile"),
+    ("1920'ler İstanbul limanı", "bir hamalın kaçakçılar ve gümrük arasında seçim yapması"),
+    ("1960'larda Almanya'ya göçen bir aile", "memlekette bırakılan çocuk ve geri dönüş sözü"),
+    ("Antik Roma'da bir gladyatör okulu", "özgürlüğünü satın almak için dövüşen bir köle"),
+    ("17. yüzyıl Osmanlı saray mutfağı", "sarayda zehir iddiası ve bir aşçının sırrı"),
+    ("kuzeyde bir Viking balıkçı köyü", "kan davası yüzünden sürgün edilen bir gemi ustası"),
+    ("Brezilya kahve tarlaları, 1900'ler", "borç sözleşmesiyle toprağa bağlanan bir işçi ailesi"),
+    ("Sibirya'da bir avcı kulübesi", "kışın ortasında kaybolan kardeşi arayan bir kadın"),
+    ("Mısır'da bir piramit şantiyesi", "ustabaşının oğlu ve yıllardır saklanan bir plan"),
+    ("1990'lar İstanbul'unda bir gecekondu mahallesi", "arsa tapusu yüzünden bölünen bir aile"),
+    ("İpek Yolu'nda bir kervan", "yol kesicilerle pazarlık eden genç bir tüccar"),
+    ("bir maden kasabası, 1930'lar", "göçükten sonra kurtarma ekibine katılan bir madenci"),
+]
+
+
+def _used_seeds():
+    f = ROOT / "memory" / "used_seeds.json"
+    try:
+        used = json.loads(f.read_text())
+        return used if isinstance(used, list) else []
+    except Exception:
+        return []
+
+
+def _next_seed():
+    used = _used_seeds()
+    idx = len(used) % len(SERIES_SEEDS)
+    era, conflict = SERIES_SEEDS[idx]
+    used.append(idx)
+    (ROOT / "memory").mkdir(exist_ok=True)
+    (ROOT / "memory" / "used_seeds.json").write_text(json.dumps(used))
+    return idx, era, conflict
+
+
+def series_len():
+    """OpsHub may ask for a shorter/longer arc; falls back to MAX_EPISODES."""
+    return hub.series_length(MAX_EPISODES)
 
 class DailyLimitError(Exception):
     pass
@@ -80,13 +124,23 @@ STRUCTURE = (
     "Zaman atlaması olmadan seviye atlama; 'time' alanına da o ifadeyi yaz.\n"
 )
 
-def visual_rules(bible):
+def visual_rules(bible, fresh=False):
+    if fresh:
+        cast = (
+            "  - mode wide/closeup ise, memory içinde döndürdüğün \"character\" dizesini\n"
+            "    HER görselde kelimesi kelimesine tekrar et (yüz hiç değişmesin).\n"
+            "  - mode pov ise \"character_pov\" dizesini tekrar et (yüz görünmez, kamera onun gözü).\n"
+        )
+    else:
+        cast = (
+            "  - mode wide/closeup ise KARAKTER dizesinin TAMAMI kelimesi kelimesine (yüz hiç değişmesin):\n"
+            f"    {bible['character']}\n"
+            "  - mode pov ise POV KARAKTER dizesi (yüz görünmez, kamera onun gözü):\n"
+            f"    {bible['character_pov']}\n"
+        )
     return (
         "GÖRSEL: her çekimin 'visual' alanı İNGİLİZCE yazılır ve şunları içerir:\n"
-        "  - mode wide/closeup ise KARAKTER dizesinin TAMAMI kelimesi kelimesine (yüz hiç değişmesin):\n"
-        f"    {bible['character']}\n"
-        "  - mode pov ise POV KARAKTER dizesi (yüz görünmez, kamera onun gözü):\n"
-        f"    {bible['character_pov']}\n"
+        + cast +
         "  - yüzdeki duygu + net bir fiziksel eylem + en az 3 somut ortam detayı (eşya, hava, kalabalık, doku)\n"
         "  - kamera dili: varışta geniş açı, güç anında alçak açı, yüz yüze hesaplaşmada omuz üstü,\n"
         "    duygusal dorukta ekstrem yakın plan\n"
@@ -136,14 +190,14 @@ KURALLAR: gerçek marka ya da gerçek kişi yok; görseller hep AYNI kişiyi anl
 her çekimde mode alanı yukarıdaki sıraya uyar (wide, pov, closeup); 21 çekimden az ya da çok yazma.
 """
 
-def build_prompt(memory_text, bible, flavor, last_flavor):
+def build_prompt(memory_text, bible, flavor, last_flavor, fresh=False):
     avoid = (f"Önceki bölümün tadı \"{last_flavor}\" idi; aynısını TEKRAR ETME.\n"
              if last_flavor else "")
     return (
         ROLE + "\n"
         + memory_text + "\n\n"
         + STRUCTURE + "\n"
-        + visual_rules(bible) + "\n"
+        + visual_rules(bible, fresh) + "\n"
         + NARRATION_RULES + "\n"
         + f"BÖLÜM TADI: bu bölümün tadı \"{flavor}\" olacak. {avoid}"
           "Tadı hikâyenin temposuna, gerilimine ve sonucuna yansıt.\n\n"
@@ -353,33 +407,60 @@ def cmd_write(ep_id, topic):
         print(f"[write] {out} already exists — skipping (idempotent)")
         return
     st = load_state()
-    if st and not st.get("finished") and st.get("episode_number", 0) < MAX_EPISODES:
+    limit = series_len()
+    if st and hub.trigger_flag("new_series"):
+        print("[write] OpsHub asked for a new series - archiving the current arc")
+        try:
+            (ROOT / "memory" / "series_state.json").replace(
+                ROOT / "memory" / "series_state.prev.json")
+        except OSError:
+            pass
+        st = None
+    fresh = not (st and not st.get("finished") and st.get("episode_number", 0) < limit)
+    era = ""
+    conflict = ""
+    if not fresh:
         n = st["episode_number"] + 1
         memory_text = (
-            f"'{st['series_title']}' DİZİSİNİ SÜRDÜR — bu bölüm {n}/{MAX_EPISODES}.\n"
+            f"'{st['series_title']}' DİZİSİNİ SÜRDÜR — bu bölüm {n}/{limit}.\n"
             f"{st['episode_number']}. bölümün özeti: {st.get('last_recap', '')}\n"
             f"O bölüm şu cliffhanger ile bitti: {st.get('ending_cliffhanger', '')}\n"
-            "AYNI hikâyeyi AYNI karakterlerle sürdür. Baştan başlama."
+            "AYNI hikâyeyi AYNI karakterlerle sürdür. Baştan başlama.\n"
+            f"Dizinin karakteri (DEĞİŞMESİN): {st.get('character', '')}\n"
+            f"Dizinin dönemi/mekânı (DEĞİŞMESİN): {st.get('seed', '')}"
         )
         if st.get("last_hook"):
             memory_text += (f"\nÖnceki bölümün bitiş kalıbı: {st['last_hook']}. "
                             "Bu bölümde DİĞER iki kalıptan birini kullan.")
     else:
         n = 1
+        seed_idx, era, conflict = _next_seed()
+        print(f"[write] new series seed #{seed_idx}: {era}")
         memory_text = (
-            "YEPYENİ BİR DİZİ BAŞLAT (henüz hiçbir şey yok). Özgün bir öncül, özgün\n"
-            f"karakterler ve özgün bir dizi adı uydur. Dizi {MAX_EPISODES} bölüm sürecek,\n"
-            "bu yüzden ilerideki bölümler için tohum ek. Türkçe bir isim seç."
+            "YEPYENİ BİR DİZİ BAŞLAT (henüz hiçbir şey yok).\n"
+            f"TOHUM — dönem ve mekân: {era}\n"
+            f"ÇEKİRDEK ÇATIŞMA: {conflict}\n"
+            "Özgün bir öncül, özgün karakterler ve özgün bir dizi adı uydur; bu tohuma bağlı kal.\n"
+            f"Dizi {limit} bölüm sürecek, bu yüzden ilerideki bölümler için tohum ek. Türkçe bir isim seç.\n"
+            "Karakter her bölümde AYNI kişi kalacak; memory nesnesine şu iki alanı da ekle ve\n"
+            "bundan sonraki bölümlerde birebir kullanılacak şekilde yaz:\n"
+            "  \"character\": \"<İNGİLİZCE tek satır: yüz, yaş, saç, kıyafet, ayırt edici iz>\"\n"
+            "  \"character_pov\": \"<İNGİLİZCE tek satır: birinci şahıs POV, yüz görünmez>\""
         )
     if topic:
         memory_text += f"\nYapımcının notu (buna uy): {topic}"
+
+    bible = dict(DEFAULT_BIBLE)
+    if not fresh and st:
+        bible["character"] = st.get("character") or bible["character"]
+        bible["character_pov"] = st.get("character_pov") or bible["character_pov"]
 
     last_flavor = (st or {}).get("last_flavor", "")
     options = [f for f in FLAVORS if f != last_flavor] or list(FLAVORS)
     flavor = options[(n - 1) % len(options)]
 
-    print(f"[write] series episode #{n} of {MAX_EPISODES} — tat: {flavor}")
-    prompt = build_prompt(memory_text, DEFAULT_BIBLE, flavor, last_flavor)
+    print(f"[write] series episode #{n} of {limit} — tat: {flavor}")
+    prompt = build_prompt(memory_text, bible, flavor, last_flavor, fresh)
     data = None
     last_err = None
     for attempt in range(1, 4):
@@ -433,10 +514,13 @@ def cmd_write(ep_id, topic):
            "ending_cliffhanger": str(mem.get("ending_cliffhanger", ""))[:400],
            "last_hook": str(mem.get("ending_pattern_used", ""))[:60],
            "last_flavor": flavor,   # the flavor WE picked, so rotation can't drift if the model writes something else
-           "finished": n >= MAX_EPISODES}
+           "character": str(mem.get("character") or bible["character"])[:700],
+           "character_pov": str(mem.get("character_pov") or bible["character_pov"])[:700],
+           "seed": era if fresh else str((st or {}).get("seed", ""))[:200],
+           "finished": n >= limit}
     (ROOT / "memory").mkdir(exist_ok=True)
     (ROOT / "memory" / "series_state.json").write_text(json.dumps(st2, indent=2, ensure_ascii=False))
-    print(f"[memory] episode {n}/{MAX_EPISODES} recorded"
+    print(f"[memory] episode {n}/{limit} recorded"
           + (" — SERIES COMPLETE! the next /start begins a brand-new series" if st2["finished"] else ""))
     out.write_text(json.dumps(data, indent=2, ensure_ascii=False))
     print(f"[write] OK -> {out} ({len(data['shots'])} shots)")
@@ -449,7 +533,12 @@ def cmd_produce(ep_id):
     imgs, auds, segs = ep / "images", ep / "audio", ep / "segs"
     for d in (imgs, auds, segs):
         d.mkdir(parents=True, exist_ok=True)
-    bible = DEFAULT_BIBLE
+    bible = dict(DEFAULT_BIBLE)
+    _state = load_state() or {}
+    if _state.get("character"):
+        bible["character"] = _state["character"]
+    if _state.get("character_pov"):
+        bible["character_pov"] = _state["character_pov"]
     for i, s in enumerate(shots, 1):
         out = imgs / f"L{i}.png"
         if out.exists() and out.stat().st_size > 10000:
@@ -516,6 +605,23 @@ def cmd_produce(ep_id):
     print(f"[produce] OK -> {ep / 'video.mp4'} ({size:.1f} MB, {len(shots)} shots)")
 
 # ---------------------------------------------------------------- notify
+def _emit_ready(sc, ep_id):
+    """Feed OpsHub: one episode_ready event + the refreshed series state."""
+    st = load_state() or {}
+    series = st.get("series_title") or sc.get("title", "series")
+    ep_no = st.get("episode_number") or 0
+    hub.emit_episode_ready(
+        series_id=series, episode_number=ep_no,
+        title=sc.get("title", ""), hook_type=st.get("last_hook", ""),
+        engine_version="v8", episode=ep_id, flavor=sc.get("flavor", ""),
+        shots=len(sc.get("shots", [])), language="tr", seed=st.get("seed", ""))
+    hub.emit_series_state(
+        series_id=series, episode_number=ep_no,
+        finished=bool(st.get("finished")), max_episodes=series_len(),
+        title=sc.get("title", ""), last_hook=st.get("last_hook", ""),
+        engine_version="v8", language="tr")
+
+
 def cmd_notify(ep_id):
     ep = EPS / ep_id
     sc = json.loads((ep / "script.json").read_text())
@@ -530,6 +636,7 @@ def cmd_notify(ep_id):
         print(f"[notify] {r.status_code} {r.text[:200]}")
         r.raise_for_status()
         print(f"[notify] video is {size_mb:.0f} MB — download it from the run's Artifacts")
+        _emit_ready(sc, ep_id)
         return
     with open(vid, "rb") as f:
         r = requests.post(f"{api}/sendVideo",
@@ -537,6 +644,7 @@ def cmd_notify(ep_id):
                           files={"video": f}, timeout=600)
     print(f"[notify] {r.status_code} {r.text[:200]}")
     r.raise_for_status()
+    _emit_ready(sc, ep_id)
 
 def _tell(text):
     try:
@@ -551,6 +659,10 @@ if __name__ == "__main__":
     p.add_argument("--episode", required=True)
     p.add_argument("--topic")
     a = p.parse_args()
+    if not a.topic:
+        a.topic = hub.trigger_topic()
+    if a.topic:
+        print(f"[pipeline] brief from {hub.why()}: {a.topic}")
     try:
         {"write": lambda: cmd_write(a.episode, a.topic),
          "produce": lambda: cmd_produce(a.episode),

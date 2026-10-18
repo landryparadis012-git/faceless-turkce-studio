@@ -2,6 +2,10 @@ name: produce
 on:
   workflow_dispatch:
     inputs: {topic: {description: "optional brief — empty = continue the series", required: false}}
+  # OpsHub triggers this studio with a repository_dispatch instead of a cron.
+  # client_payload: {topic, new_series, max_episodes, reason}
+  repository_dispatch:
+    types: [opshub.produce, opshub.run]
 permissions:
   contents: write
 concurrency: {group: produce, cancel-in-progress: false}
@@ -17,6 +21,10 @@ jobs:
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      HUB_URL: ${{ secrets.HUB_URL }}
+      HUB_WEBHOOK_SECRET: ${{ secrets.HUB_WEBHOOK_SECRET }}
+      # repository_dispatch payload -> pipeline.py (see hub.py)
+      HUB_PAYLOAD: ${{ toJSON(github.event.client_payload) }}
     steps:
       - uses: actions/checkout@v4
         with: {fetch-depth: 0}
@@ -55,70 +63,11 @@ jobs:
           for i in 1 2 3; do git push && break || (git pull --rebase --autostash origin main; sleep 3); done
       - name: sync episode to OpsHub
         if: steps.run.outcome == 'success'
-        shell: python
         env:
           HUB_URL: ${{ secrets.HUB_URL }}
           HUB_WEBHOOK_SECRET: ${{ secrets.HUB_WEBHOOK_SECRET }}
           GITHUB_REPOSITORY: ${{ github.repository }}
-        run: |
-          import hashlib, hmac, json, os, re, time, urllib.request
-
-          state_path = "memory/series_state.json"
-          if not os.path.exists(state_path):
-              print("hub_sync: no series_state.json, skipping")
-              raise SystemExit(0)
-
-          with open(state_path) as f:
-              state = json.load(f)
-
-          def slug(s):
-              return re.sub(r"[^a-z0-9]+", "-", (s or "series").lower()).strip("-") or "series"
-
-          series_id = slug(state.get("title", "series"))
-          ep = int(state.get("episode_number", 0) or 0)
-          repo = os.environ.get("GITHUB_REPOSITORY", "").split("/")[-1]
-          now = int(time.time())
-
-          events = [{
-              "schema_version": 1,
-              # deterministic id: a retried episode re-sync dedupes at the hub
-              "event_id": f"studio-{series_id}-ep{ep}-ready",
-              "type": "content.episode_ready",
-              "source": "studio",
-              "series_id": series_id,
-              "channel_name": repo,
-              "episode_number": ep,
-              "title": state.get("title", ""),
-              "hook_type": state.get("last_hook", ""),
-              "occurred_at": now,
-              "engine_version": "v8",
-          }]
-          if state.get("finished"):
-              events.append({
-                  "schema_version": 1,
-                  "event_id": f"studio-{series_id}-finished-ep{ep}",
-                  "type": "content.series_finished",
-                  "source": "studio",
-                  "series_id": series_id,
-                  "channel_name": repo,
-                  "episode_number": ep,
-                  "occurred_at": now,
-              })
-
-          url = os.environ["HUB_URL"].rstrip("/") + "/ingest"
-          secret = os.environ["HUB_WEBHOOK_SECRET"].encode()
-          for ev in events:
-              body = json.dumps(ev).encode()
-              mac = hmac.new(secret, body, hashlib.sha256)
-              req = urllib.request.Request(
-                  url, data=body, method="POST",
-                  headers={
-                      "Content-Type": "application/json",
-                      "x-hub-signature-256": "sha256=" + mac.hexdigest(),
-                  },
-              )
-              with urllib.request.urlopen(req, timeout=15) as resp:
-                  print("hub_sync:", ev["type"], "->", resp.status, resp.read().decode())
+        run: python hub.py state
       - name: report errors to telegram
         if: ${{ always() && steps.run.outcome != 'success' }}
         run: |
