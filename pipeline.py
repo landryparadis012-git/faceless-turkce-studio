@@ -13,7 +13,7 @@ NOTE FOR THE OWNER: all code comments and log lines are in English on purpose.
 Only the strings sent to the LLM (ROLE / SCHEMA / prompts) are Turkish, because
 those are what make the generated script Turkish. Changing them changes the output.
 """
-import argparse, base64, datetime, json, os, socket, subprocess, sys, urllib.request, urllib.error
+import argparse, base64, datetime, json, os, socket, subprocess, sys, time, urllib.request, urllib.error
 from pathlib import Path
 import requests
 
