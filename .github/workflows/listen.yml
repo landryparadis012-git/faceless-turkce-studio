@@ -1,6 +1,6 @@
 name: listen
 on:
-  schedule: [{cron: "0 * * * *"}]
+  # Telegram commands are centralized in OpsHub's webhook; do not poll getUpdates here.
   workflow_dispatch:
 permissions:
   actions: write
